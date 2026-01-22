@@ -268,6 +268,7 @@ def main() -> int:
 
     stream = open_stream(args)
     count = 0
+    last_tick_ns: Optional[int] = None
     try:
         for length, payload, expected, received in iter_frames(stream):
             count += 1
@@ -276,8 +277,22 @@ def main() -> int:
             name = PACKET_TYPES.get(packet_type, "UNKNOWN")
             status = "OK" if crc_ok else "BAD_CRC"
             msg = decode_packet(payload)
-            ts = time.strftime("%H:%M:%S")
-            line = f"{ts} [{count:05d}] len={length} type={name} crc={status} :: {msg}"
+            now_wall = time.time()
+            ts = time.strftime("%H:%M:%S", time.localtime(now_wall))
+            ms = int(now_wall * 1000) % 1000
+            tick_ns = time.perf_counter_ns()
+            if last_tick_ns is None:
+                delta_text = "dt=---"
+            else:
+                dt_ns = tick_ns - last_tick_ns
+                dt_ms = dt_ns / 1_000_000.0
+                rate_hz = 1_000.0 / dt_ms if dt_ms > 0 else 0.0
+                delta_text = f"dt={dt_ms:.3f}ms rate={rate_hz:.1f}Hz"
+            last_tick_ns = tick_ns
+            line = (
+                f"{ts}.{ms:03d} [{count:05d}] len={length} type={name} "
+                f"crc={status} {delta_text} :: {msg}"
+            )
             print(line)
             if args.raw:
                 print(f"  raw={payload.hex()}")
