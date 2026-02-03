@@ -225,7 +225,8 @@ def open_stream(args: argparse.Namespace) -> BinaryIO:
     if args.device:
         # Use pyserial for UART device
         try:
-            ser = serial.Serial(args.device, baudrate=115200, timeout=1)
+            # Block indefinitely so the reader doesn't time out when idle.
+            ser = serial.Serial(args.device, baudrate=115200, timeout=None)
             return ser
         except serial.SerialException as e:
             print(f"Failed to open serial port {args.device}: {e}", file=sys.stderr)
