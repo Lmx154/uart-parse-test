@@ -24,7 +24,6 @@ CRC_POLY = 0x1021
 
 PACKET_TYPES = {
     0x00: "KEEPALIVE",
-    0x01: "RC_DATA",
     0x02: "COMMAND",
     0x10: "LINK_STATS",
     0x11: "ACK",
@@ -197,8 +196,6 @@ def decode_packet(payload: bytes) -> str:
     body = payload[1:]
     if packet_type == 0x00:
         return "KEEPALIVE"
-    if packet_type == 0x01:
-        return f"RC_DATA len={len(body)} data={body.hex()}"
     if packet_type == 0x02:
         return decode_command(body)
     if packet_type == 0x10:

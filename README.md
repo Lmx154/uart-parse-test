@@ -1,75 +1,60 @@
-# UART Script
+# UART Parser + Local Backend
 
-A Python script to decode MARV UART frames from a file, serial device, or stdin.
+This project now contains:
 
-## Description
+- A CLI UART decoder (`main.py`)
+- A FastAPI backend for local web UI control and telemetry streaming (`backend/`)
 
-This tool parses UART frames with a specific format: `[0xA5, 0x5A] [len] [packet_type + payload] [crc16_le]`, using CRC16-CCITT for validation. It supports various packet types including telemetry data (IMU, barometer, magnetometer, GPS, system), commands, acknowledgments, and link statistics.
+Frame format:
 
-## Installation
+`[0xA5, 0x5A] [len] [packet_type + payload] [crc16_le]`
 
-1. Ensure you have Python 3.14 or later installed.
-2. Install dependencies:
-   ```bash
-   pip install -e .
-   ```
-   Or manually:
-   ```bash
-   pip install pyserial>=3.5
-   ```
+CRC16-CCITT (`init=0xFFFF`, `poly=0x1021`) is computed over `len + packet_bytes`.
 
-## Usage
-
-Run the script with Python:
+## Install (UV)
 
 ```bash
-python main.py [options]
+uv sync
 ```
 
-### Options
+## Run the backend
 
-- `-f, --file FILE`: Read from a file. Use `-` for stdin (default).
-- `-d, --device DEVICE`: Read from a serial device (e.g., `/dev/ttyUSB0`).
-- `--list-ports`: List available serial ports and exit.
-- `-n, --limit N`: Stop after N frames (0 = unlimited, default: 0).
-- `--raw`: Include raw payload hex in output.
+```bash
+uv run uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+```
 
-### Examples
+## Backend API
 
-1. **Decode from a file:**
-   ```bash
-   python main.py -f data.bin
-   ```
+- `POST /serial/open`
+  - Body: `{"port":"/dev/ttyUSB0","baudrate":115200}`
+- `POST /serial/close`
+- `POST /serial/write`
+  - Body: `{"hex_data":"A55A0201ABCD"}` (raw bytes in hex)
+- `GET /serial/ports`
+  - Returns dropdown-friendly options: `{"ports":[{"value":"/dev/ttyUSB0","label":"/dev/ttyUSB0 - USB Serial", ...}]}`
+- `GET /serial/status`
+- `GET /health`
+- `WS /ws/telemetry`
+  - Broadcasts frame events while serial is open.
+  - Each event includes:
+    - `decoded` (human-readable string),
+    - `parsed` (structured fields for the packet),
+    - `telemetry` (normalized realtime metrics for frontend use).
 
-2. **Decode from a serial device:**
-   ```bash
-   python main.py -d /dev/ttyACM0
-   ```
+## Front-end toggle model
 
-3. **List available serial ports:**
-   ```bash
-   python main.py --list-ports
-   ```
+- Toggle ON: call `POST /serial/open`, then connect websocket `ws://127.0.0.1:8000/ws/telemetry`
+- Toggle OFF: call `POST /serial/close`
+- Command send: call `POST /serial/write`
 
-4. **Decode from stdin with raw output and limit to 10 frames:**
-   ```bash
-   cat data.bin | python main.py --raw -n 10
-   ```
+## CLI decoder
 
-5. **Pipe data into the script:**
-   ```bash
-   some_command | python main.py
-   ```
+```bash
+uv run main.py --help
+```
 
-## Packet Types
+Useful example:
 
-The script decodes the following packet types:
-- `KEEPALIVE`: Keep-alive packet.
-- `RC_DATA`: Remote control data.
-- `COMMAND`: Command packets with sequence, ID, and payload.
-- `LINK_STATS`: Link statistics (RSSI, SNR, LQ).
-- `ACK`: Acknowledgment with sequence number.
-- `TELEMETRY_*`: Various telemetry data (IMU, barometer, magnetometer, GPS, system).
-- `TELEMETRY_BURST`: Burst of telemetry samples.
-
-Output includes timestamp, frame count, length, packet type, CRC status, and decoded message.
+```bash
+uv run main.py -d /dev/ttyUSB0
+```

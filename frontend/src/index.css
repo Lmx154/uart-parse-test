@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+	margin: 0;
+}
+
+body.theme-dark {
+	color: rgb(255 255 255);
+	background-color: rgb(0 0 0);
+}
+
+body.theme-light {
+	color: rgb(17 24 39);
+	background-color: rgb(243 244 246);
+}
+
+body.theme-light .bg-black\/40 {
+	background-color: rgb(255 255 255 / 0.82);
+}
+
+body.theme-light .text-white {
+	color: rgb(17 24 39);
+}
+
+body.theme-light .text-gray-500,
+body.theme-light .text-gray-400 {
+	color: rgb(75 85 99);
+}
+
+body.theme-light .border-gray-700,
+body.theme-light .border-gray-600,
+body.theme-light .border-gray-700\/50 {
+	border-color: rgb(209 213 219);
+}
+
+body.theme-light .bg-gray-700 {
+	background-color: rgb(209 213 219);
+}
+
+body.theme-light .from-gray-900\/80 {
+	--tw-gradient-from: rgb(229 231 235 / 0.85) var(--tw-gradient-from-position);
+}
