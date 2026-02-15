@@ -17,7 +17,7 @@ import {
   getSerialStatus,
   getTelemetryWebSocketUrl,
   openSerialPort,
-  writeSerialHex,
+  writeSerialCommand,
   type PortOption,
   type SerialStatus,
 } from './services/api';
@@ -35,6 +35,18 @@ const timelineStages = [
 type AppTheme = 'dark' | 'light';
 type Units = 'metric' | 'imperial';
 type TabId = 'dashboard' | 'data' | 'terminal' | 'command' | 'settings';
+
+interface DiagnosticsSnapshot {
+  wsPacketsPerSec: number;
+  telemetryProcessedPerSec: number;
+  telemetryCommitsPerSec: number;
+  terminalCommitsPerSec: number;
+  terminalBufferedLines: number;
+  terminalPacketLogsDroppedPerSec: number;
+  msSinceLastPacket: number | null;
+  backendQueueDepth: number;
+  backendQueueDropped: number;
+}
 
 interface TelemetryState {
   missionTime: number;
@@ -57,17 +69,26 @@ interface TelemetryEvent {
   decoded?: string;
   type?: string;
   message?: string;
+  detail?: string;
   parsed?: Record<string, unknown>;
   telemetry?: Record<string, unknown>;
+  queue_depth?: number;
+  queue_dropped?: number;
 }
 
 const MAX_TERMINAL_LINES = 220;
 const BAUDRATE_STORAGE_KEY = 'dashboard-baudrate';
+const SERIAL_TIMEOUT_STORAGE_KEY = 'dashboard-serial-timeout-ms';
 const HISTORY_POINTS_STORAGE_KEY = 'dashboard-history-points';
+const PROCESS_TELEMETRY_UI_STORAGE_KEY = 'dashboard-process-telemetry-ui';
+const RENDER_DATALAB_CHARTS_STORAGE_KEY = 'dashboard-render-datalab-charts';
+const TERMINAL_PACKET_LOGGING_STORAGE_KEY = 'dashboard-terminal-packet-logging';
 const DEFAULT_HISTORY_POINT_LIMIT = 10;
 const MIN_HISTORY_POINT_LIMIT = 2;
 const TELEMETRY_COMMIT_INTERVAL_MS = 50;
 const TERMINAL_COMMIT_INTERVAL_MS = 100;
+const TERMINAL_PACKET_LOG_LIMIT_PER_SEC = 15;
+const GS_COMMANDS = ['ARM', 'DISARM', 'RTL', 'HOLD'] as const;
 
 const createInitialTelemetry = (): TelemetryState => ({
   missionTime: 0,
@@ -113,6 +134,8 @@ const extractNumericField = (source: Record<string, unknown> | undefined, key: s
   const value = source[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 };
+
+const normalizeGsCommand = (input: string) => input.trim().toUpperCase();
 
 const appendLineInPlace = (lines: string[], line: string) => {
   lines.push(line);
@@ -173,12 +196,32 @@ function App() {
     const saved = Number(localStorage.getItem(BAUDRATE_STORAGE_KEY));
     return Number.isFinite(saved) && saved > 0 ? saved : 115200;
   });
+  const [selectedSerialTimeoutMs, setSelectedSerialTimeoutMs] = useState<number | null>(() => {
+    const saved = localStorage.getItem(SERIAL_TIMEOUT_STORAGE_KEY);
+    if (!saved || saved === 'none') {
+      return null;
+    }
+    const parsed = Number(saved);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+  });
   const [historyPointLimit, setHistoryPointLimit] = useState<number>(() => {
     const saved = Number(localStorage.getItem(HISTORY_POINTS_STORAGE_KEY));
     if (!Number.isFinite(saved)) {
       return DEFAULT_HISTORY_POINT_LIMIT;
     }
     return Math.max(MIN_HISTORY_POINT_LIMIT, Math.floor(saved));
+  });
+  const [processTelemetryUi, setProcessTelemetryUi] = useState(() => {
+    const saved = localStorage.getItem(PROCESS_TELEMETRY_UI_STORAGE_KEY);
+    return saved !== 'false';
+  });
+  const [renderDataLabCharts, setRenderDataLabCharts] = useState(() => {
+    const saved = localStorage.getItem(RENDER_DATALAB_CHARTS_STORAGE_KEY);
+    return saved !== 'false';
+  });
+  const [terminalPacketLoggingEnabled, setTerminalPacketLoggingEnabled] = useState(() => {
+    const saved = localStorage.getItem(TERMINAL_PACKET_LOGGING_STORAGE_KEY);
+    return saved !== 'false';
   });
 
   const [currentStageIndex, setCurrentStageIndex] = useState(0);
@@ -196,6 +239,17 @@ function App() {
     frames: 0,
   });
   const [commandHex, setCommandHex] = useState('');
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot>({
+    wsPacketsPerSec: 0,
+    telemetryProcessedPerSec: 0,
+    telemetryCommitsPerSec: 0,
+    terminalCommitsPerSec: 0,
+    terminalBufferedLines: 0,
+    terminalPacketLogsDroppedPerSec: 0,
+    msSinceLastPacket: null,
+    backendQueueDepth: 0,
+    backendQueueDropped: 0,
+  });
 
   const missionStartTsRef = useRef<number | null>(null);
   const previousAltitudeRef = useRef<number | null>(null);
@@ -210,6 +264,19 @@ function App() {
   const pendingTelemetryCommitRef = useRef<number | null>(null);
   const lastTerminalCommitRef = useRef(0);
   const pendingTerminalCommitRef = useRef<number | null>(null);
+  const activeTabRef = useRef<TabId>(activeTab);
+  const processTelemetryUiRef = useRef(processTelemetryUi);
+  const terminalPacketLoggingEnabledRef = useRef(terminalPacketLoggingEnabled);
+  const wsPacketsTotalRef = useRef(0);
+  const telemetryProcessedTotalRef = useRef(0);
+  const telemetryCommitsTotalRef = useRef(0);
+  const terminalCommitsTotalRef = useRef(0);
+  const terminalPacketLogsDroppedTotalRef = useRef(0);
+  const lastWsPacketPerfTsRef = useRef<number | null>(null);
+  const terminalPacketLogWindowStartRef = useRef<number>(performance.now());
+  const terminalPacketLogCountRef = useRef(0);
+  const backendQueueDepthRef = useRef(0);
+  const backendQueueDroppedRef = useRef(0);
 
   const commitTelemetryNow = (nextTelemetry: TelemetryState) => {
     if (pendingTelemetryCommitRef.current !== null) {
@@ -217,6 +284,7 @@ function App() {
       pendingTelemetryCommitRef.current = null;
     }
     lastTelemetryCommitRef.current = performance.now();
+    telemetryCommitsTotalRef.current += 1;
     setTelemetry(nextTelemetry);
   };
 
@@ -248,6 +316,10 @@ function App() {
       pendingTerminalCommitRef.current = null;
     }
     lastTerminalCommitRef.current = performance.now();
+    if (activeTabRef.current !== 'terminal') {
+      return;
+    }
+    terminalCommitsTotalRef.current += 1;
     setTerminalLines([...terminalLinesRef.current]);
   };
 
@@ -269,7 +341,30 @@ function App() {
 
   const logTerminalLine = (line: string) => {
     appendLineInPlace(terminalLinesRef.current, line);
+    if (activeTabRef.current !== 'terminal') {
+      return;
+    }
     scheduleTerminalCommit();
+  };
+
+  const logPacketLine = (line: string) => {
+    if (!terminalPacketLoggingEnabledRef.current) {
+      return;
+    }
+
+    const now = performance.now();
+    if (now - terminalPacketLogWindowStartRef.current >= 1000) {
+      terminalPacketLogWindowStartRef.current = now;
+      terminalPacketLogCountRef.current = 0;
+    }
+
+    if (terminalPacketLogCountRef.current < TERMINAL_PACKET_LOG_LIMIT_PER_SEC) {
+      terminalPacketLogCountRef.current += 1;
+      logTerminalLine(line);
+      return;
+    }
+
+    terminalPacketLogsDroppedTotalRef.current += 1;
   };
 
   const clearTerminal = () => {
@@ -318,8 +413,38 @@ function App() {
   }, [units]);
 
   useEffect(() => {
+    activeTabRef.current = activeTab;
+    if (activeTab !== 'terminal') {
+      return;
+    }
+    terminalCommitsTotalRef.current += 1;
+    setTerminalLines([...terminalLinesRef.current]);
+  }, [activeTab]);
+
+  useEffect(() => {
     localStorage.setItem(BAUDRATE_STORAGE_KEY, String(selectedBaudrate));
   }, [selectedBaudrate]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      SERIAL_TIMEOUT_STORAGE_KEY,
+      selectedSerialTimeoutMs === null ? 'none' : String(selectedSerialTimeoutMs)
+    );
+  }, [selectedSerialTimeoutMs]);
+
+  useEffect(() => {
+    localStorage.setItem(PROCESS_TELEMETRY_UI_STORAGE_KEY, String(processTelemetryUi));
+    processTelemetryUiRef.current = processTelemetryUi;
+  }, [processTelemetryUi]);
+
+  useEffect(() => {
+    localStorage.setItem(RENDER_DATALAB_CHARTS_STORAGE_KEY, String(renderDataLabCharts));
+  }, [renderDataLabCharts]);
+
+  useEffect(() => {
+    localStorage.setItem(TERMINAL_PACKET_LOGGING_STORAGE_KEY, String(terminalPacketLoggingEnabled));
+    terminalPacketLoggingEnabledRef.current = terminalPacketLoggingEnabled;
+  }, [terminalPacketLoggingEnabled]);
 
   useEffect(() => {
     const normalizedLimit = Math.max(MIN_HISTORY_POINT_LIMIT, Math.floor(historyPointLimit));
@@ -334,6 +459,45 @@ function App() {
     telemetryStateRef.current = trimmedTelemetry;
     commitTelemetryNow(trimmedTelemetry);
   }, [historyPointLimit]);
+
+  useEffect(() => {
+    let previousWsPackets = wsPacketsTotalRef.current;
+    let previousTelemetryProcessed = telemetryProcessedTotalRef.current;
+    let previousTelemetryCommits = telemetryCommitsTotalRef.current;
+    let previousTerminalCommits = terminalCommitsTotalRef.current;
+    let previousTerminalPacketLogsDropped = terminalPacketLogsDroppedTotalRef.current;
+
+    const interval = window.setInterval(() => {
+      const wsPackets = wsPacketsTotalRef.current;
+      const telemetryProcessed = telemetryProcessedTotalRef.current;
+      const telemetryCommits = telemetryCommitsTotalRef.current;
+      const terminalCommits = terminalCommitsTotalRef.current;
+      const now = performance.now();
+      const lastPacketTs = lastWsPacketPerfTsRef.current;
+
+      setDiagnostics({
+        wsPacketsPerSec: wsPackets - previousWsPackets,
+        telemetryProcessedPerSec: telemetryProcessed - previousTelemetryProcessed,
+        telemetryCommitsPerSec: telemetryCommits - previousTelemetryCommits,
+        terminalCommitsPerSec: terminalCommits - previousTerminalCommits,
+        terminalBufferedLines: terminalLinesRef.current.length,
+        terminalPacketLogsDroppedPerSec: terminalPacketLogsDroppedTotalRef.current - previousTerminalPacketLogsDropped,
+        msSinceLastPacket: lastPacketTs === null ? null : Math.round(now - lastPacketTs),
+        backendQueueDepth: backendQueueDepthRef.current,
+        backendQueueDropped: backendQueueDroppedRef.current,
+      });
+
+      previousWsPackets = wsPackets;
+      previousTelemetryProcessed = telemetryProcessed;
+      previousTelemetryCommits = telemetryCommits;
+      previousTerminalCommits = terminalCommits;
+      previousTerminalPacketLogsDropped = terminalPacketLogsDroppedTotalRef.current;
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const applyThemeClass = theme === 'dark' ? 'theme-dark' : 'theme-light';
@@ -354,6 +518,11 @@ function App() {
         }
         if (status.baudrate) {
           setSelectedBaudrate(status.baudrate);
+        }
+        if (typeof status.timeout_ms === 'number' && Number.isFinite(status.timeout_ms) && status.timeout_ms > 0) {
+          setSelectedSerialTimeoutMs(Math.floor(status.timeout_ms));
+        } else if (status.timeout_ms === null) {
+          setSelectedSerialTimeoutMs(null);
         }
       } catch {
         logTerminalLine('[status] Unable to fetch serial status');
@@ -439,6 +608,14 @@ function App() {
         try {
           const packet = JSON.parse(event.data) as TelemetryEvent;
           const timestamp = packet.ts ?? Date.now() / 1000;
+          wsPacketsTotalRef.current += 1;
+          lastWsPacketPerfTsRef.current = performance.now();
+          if (typeof packet.queue_depth === 'number' && Number.isFinite(packet.queue_depth)) {
+            backendQueueDepthRef.current = Math.max(0, Math.floor(packet.queue_depth));
+          }
+          if (typeof packet.queue_dropped === 'number' && Number.isFinite(packet.queue_dropped)) {
+            backendQueueDroppedRef.current = Math.max(0, Math.floor(packet.queue_dropped));
+          }
 
           if (missionStartTsRef.current === null) {
             missionStartTsRef.current = timestamp;
@@ -447,11 +624,14 @@ function App() {
 
           if (packet.type === 'error') {
             logTerminalLine(`[error] ${packet.message ?? 'Unknown serial error'}`);
+            if (packet.detail) {
+              logTerminalLine(`[error-detail] ${packet.detail}`);
+            }
             return;
           }
 
           const line = `[f${packet.frame ?? '-'}] ${packet.packet_name ?? 'PACKET'} ${packet.decoded ?? ''}`.trim();
-          logTerminalLine(line);
+          logPacketLine(line);
 
           const shouldProcessTelemetry =
             lastTelemetryProcessTsRef.current === null ||
@@ -459,7 +639,11 @@ function App() {
           if (!shouldProcessTelemetry) {
             return;
           }
+          if (!processTelemetryUiRef.current) {
+            return;
+          }
           lastTelemetryProcessTsRef.current = timestamp;
+          telemetryProcessedTotalRef.current += 1;
 
           const telemetryFields = packet.telemetry;
           const nextBatteryMv =
@@ -630,6 +814,8 @@ function App() {
     previousVelocityRef.current = 0;
     lastTelemetryProcessTsRef.current = null;
     lastHistorySampleTsRef.current = null;
+    terminalPacketLogWindowStartRef.current = performance.now();
+    terminalPacketLogCountRef.current = 0;
     setCurrentStageIndex(0);
     const nextTelemetry = createInitialTelemetry();
     telemetryStateRef.current = nextTelemetry;
@@ -654,13 +840,24 @@ function App() {
         return;
       }
 
-      const status = await openSerialPort(selectedPort, selectedBaudrate);
+      const status = await openSerialPort(selectedPort, selectedBaudrate, selectedSerialTimeoutMs);
       setSerialStatus(status);
       if (status.baudrate) {
         setSelectedBaudrate(status.baudrate);
       }
+      if (typeof status.timeout_ms === 'number' && Number.isFinite(status.timeout_ms) && status.timeout_ms > 0) {
+        setSelectedSerialTimeoutMs(Math.floor(status.timeout_ms));
+      } else if (status.timeout_ms === null) {
+        setSelectedSerialTimeoutMs(null);
+      }
       resetTelemetrySession();
-      logTerminalLine(`[serial] Opened ${status.port ?? selectedPort} @ ${status.baudrate ?? selectedBaudrate}`);
+      const timeoutLabel =
+        status.timeout_ms === null || status.timeout_ms === undefined
+          ? 'timeout=never'
+          : `timeout=${status.timeout_ms}ms`;
+      logTerminalLine(
+        `[serial] Opened ${status.port ?? selectedPort} @ ${status.baudrate ?? selectedBaudrate} (${timeoutLabel})`
+      );
     } catch {
       logTerminalLine('[serial] Failed to change serial connection');
     } finally {
@@ -673,12 +870,26 @@ function App() {
       return;
     }
 
+    const normalizedCommand = normalizeGsCommand(commandHex);
+    if (!normalizedCommand) {
+      logTerminalLine('[tx] Command is empty');
+      return;
+    }
+    if (!(GS_COMMANDS as readonly string[]).includes(normalizedCommand)) {
+      logTerminalLine('[tx] Invalid command. Use ARM, DISARM, RTL, or HOLD');
+      return;
+    }
+
     try {
-      const written = await writeSerialHex(commandHex);
-      logTerminalLine(`[tx] ${written} bytes -> ${commandHex}`);
+      const written = await writeSerialCommand(normalizedCommand);
+      logTerminalLine(`[tx] ${written} bytes -> ${normalizedCommand}`);
       setCommandHex('');
-    } catch {
-      logTerminalLine('[tx] Failed to send command');
+    } catch (error) {
+      if (error instanceof Error && error.message) {
+        logTerminalLine(`[tx] Failed: ${error.message}`);
+      } else {
+        logTerminalLine('[tx] Failed to send command');
+      }
     }
   };
 
@@ -761,13 +972,34 @@ function App() {
           </div>
         )}
 
-        {activeTab === 'data' && (
-          <RealtimeGraphBuilder
-            samples={telemetry.sampleHistory}
-            units={units}
-            isStreamConnected={isStreamConnected}
-          />
-        )}
+        {activeTab === 'data' &&
+          (renderDataLabCharts ? (
+            <div className="max-w-[1800px] mx-auto space-y-4">
+              {!processTelemetryUi && (
+                <div className="border border-amber-500/40 rounded-lg p-4 bg-black/40 backdrop-blur-sm">
+                  <div className="text-[11px] text-amber-400 tracking-widest mb-1">DATA LAB PAUSED</div>
+                  <div className="text-sm text-gray-300">
+                    `Process telemetry for UI` is disabled, so live chart samples are intentionally not updating.
+                  </div>
+                </div>
+              )}
+              <RealtimeGraphBuilder
+                samples={telemetry.sampleHistory}
+                units={units}
+                isStreamConnected={isStreamConnected}
+              />
+            </div>
+          ) : (
+            <div className="max-w-[1800px] mx-auto">
+              <div className="border border-orange-500/40 rounded-lg p-6 bg-black/40 backdrop-blur-sm">
+                <div className="text-gray-400 text-xs tracking-widest mb-2">DATA LAB</div>
+                <div className="text-xl font-bold tracking-wide mb-2">CHART RENDERING DISABLED</div>
+                <div className="text-sm text-gray-400">
+                  Data ingestion remains active; only graph rendering is disabled for diagnostics.
+                </div>
+              </div>
+            </div>
+          ))}
 
         {activeTab === 'terminal' && (
           <div className="max-w-[1800px] mx-auto">
@@ -783,7 +1015,7 @@ function App() {
                 <input
                   value={commandHex}
                   onChange={(event) => setCommandHex(event.target.value)}
-                  placeholder="Enter hex command (example: A55A0201ABCD)"
+                  placeholder="Enter command (ARM, DISARM, RTL, HOLD)"
                   className="flex-1 bg-black/40 border border-gray-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500"
                 />
                 <button
@@ -794,7 +1026,9 @@ function App() {
                   SEND
                 </button>
               </div>
-              <div className="text-xs text-gray-500 mt-3">Commands require an open serial port.</div>
+              <div className="text-xs text-gray-500 mt-3">
+                Commands are case-insensitive: ARM, DISARM, RTL, HOLD.
+              </div>
             </div>
           </div>
         )}
@@ -807,14 +1041,23 @@ function App() {
               ports={ports}
               selectedPort={selectedPort}
               selectedBaudrate={selectedBaudrate}
+              selectedSerialTimeoutMs={selectedSerialTimeoutMs}
               historyPointLimit={historyPointLimit}
+              processTelemetryUi={processTelemetryUi}
+              renderDataLabCharts={renderDataLabCharts}
+              terminalPacketLoggingEnabled={terminalPacketLoggingEnabled}
+              diagnostics={diagnostics}
               isOpen={serialStatus.is_open}
               isBusy={connectionBusy}
               onThemeChange={setTheme}
               onUnitsChange={setUnits}
               onPortChange={setSelectedPort}
               onBaudrateChange={setSelectedBaudrate}
+              onSerialTimeoutChange={setSelectedSerialTimeoutMs}
               onHistoryPointLimitChange={handleHistoryPointLimitChange}
+              onProcessTelemetryUiChange={setProcessTelemetryUi}
+              onRenderDataLabChartsChange={setRenderDataLabCharts}
+              onTerminalPacketLoggingEnabledChange={setTerminalPacketLoggingEnabled}
               onRefreshPorts={refreshPorts}
               onToggleConnection={toggleSerialConnection}
             />

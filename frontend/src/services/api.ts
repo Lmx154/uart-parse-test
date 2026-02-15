@@ -2,8 +2,14 @@ export interface SerialStatus {
   is_open: boolean;
   port: string | null;
   baudrate: number | null;
+  timeout_ms?: number | null;
   clients: number;
   frames: number;
+  queue_depth?: number;
+  queue_peak?: number;
+  queue_dropped?: number;
+  write_queue_depth?: number;
+  write_queue_peak?: number;
 }
 
 export interface PortOption {
@@ -55,11 +61,11 @@ export const closeSerialPort = async () => {
   return (await response.json()) as SerialStatus;
 };
 
-export const openSerialPort = async (port: string, baudrate: number) => {
+export const openSerialPort = async (port: string, baudrate: number, timeoutMs: number | null) => {
   const response = await fetch(buildUrl(SERIAL_ENDPOINTS.open), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ port, baudrate }),
+    body: JSON.stringify({ port, baudrate, timeout_ms: timeoutMs }),
   });
   ensureOk(response, 'Failed to open serial port');
   return (await response.json()) as SerialStatus;
@@ -71,7 +77,40 @@ export const writeSerialHex = async (hexData: string) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ hex_data: hexData }),
   });
-  ensureOk(response, 'Failed to write to serial port');
+  if (!response.ok) {
+    let detail = 'Failed to write to serial port';
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      if (typeof payload.detail === 'string' && payload.detail.trim()) {
+        detail = payload.detail.trim();
+      }
+    } catch {
+      // Keep fallback detail.
+    }
+    throw new Error(detail);
+  }
+  const payload = (await response.json()) as { written: number };
+  return payload.written;
+};
+
+export const writeSerialCommand = async (command: string) => {
+  const response = await fetch(buildUrl(SERIAL_ENDPOINTS.write), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command }),
+  });
+  if (!response.ok) {
+    let detail = 'Failed to write command to serial port';
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      if (typeof payload.detail === 'string' && payload.detail.trim()) {
+        detail = payload.detail.trim();
+      }
+    } catch {
+      // Keep fallback detail.
+    }
+    throw new Error(detail);
+  }
   const payload = (await response.json()) as { written: number };
   return payload.written;
 };

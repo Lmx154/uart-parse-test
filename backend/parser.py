@@ -53,9 +53,12 @@ def read_exact(stream: BinaryIO, n_bytes: int) -> Optional[bytes]:
 
 def iter_frames(stream: BinaryIO) -> Iterator[Tuple[int, bytes, int, int]]:
     sync = 0
+    is_serial_stream = hasattr(stream, "is_open")
     while True:
         b = stream.read(1)
         if not b:
+            if is_serial_stream:
+                continue
             return
         byte = b[0]
         if sync == 0:
@@ -151,27 +154,26 @@ def decode_burst(payload: bytes) -> str:
     if sample_len == 0:
         return f"TELEMETRY_BURST kind={kind}({name}) count={count} raw={payload[2:].hex()}"
 
-    samples = []
-    offset = 2
-    for _ in range(count):
-        end = offset + sample_len
-        if end > len(payload):
-            break
-        chunk = payload[offset:end]
-        if kind == 0:
-            samples.append(decode_imu(chunk))
-        elif kind == 1:
-            samples.append(decode_baro(chunk))
-        elif kind == 2:
-            samples.append(decode_mag(chunk))
-        elif kind == 3:
-            samples.append(decode_gps(chunk))
-        elif kind == 4:
-            samples.append(decode_system(chunk))
-        offset = end
+    available = max(0, (len(payload) - 2) // sample_len)
+    truncated = available < count
+    if available == 0:
+        return f"TELEMETRY_BURST kind={name} count={count} no_samples"
 
-    sample_text = "; ".join(samples) if samples else "no_samples"
-    return f"TELEMETRY_BURST kind={name} count={count} {sample_text}"
+    last_offset = 2 + (available - 1) * sample_len
+    last_chunk = payload[last_offset : last_offset + sample_len]
+    if kind == 0:
+        latest = decode_imu(last_chunk)
+    elif kind == 1:
+        latest = decode_baro(last_chunk)
+    elif kind == 2:
+        latest = decode_mag(last_chunk)
+    elif kind == 3:
+        latest = decode_gps(last_chunk)
+    else:
+        latest = decode_system(last_chunk)
+
+    truncated_text = " truncated" if truncated else ""
+    return f"TELEMETRY_BURST kind={name} count={count} samples={available}{truncated_text} latest={latest}"
 
 
 def decode_packet(payload: bytes) -> tuple[str, str]:

@@ -124,35 +124,30 @@ def _parse_burst(body: bytes) -> dict[str, Any]:
             "raw_hex": body[2:].hex(),
         }
 
-    samples: list[dict[str, Any]] = []
-    offset = 2
-    truncated = False
-
-    for _ in range(count):
-        end = offset + sample_len
-        if end > len(body):
-            truncated = True
-            break
-        chunk = body[offset:end]
-        offset = end
+    available = max(0, (len(body) - 2) // sample_len)
+    truncated = available < count
+    latest_sample: dict[str, Any] | None = None
+    if available > 0:
+        last_offset = 2 + (available - 1) * sample_len
+        last_chunk = body[last_offset : last_offset + sample_len]
         if kind_id == 0:
-            sample = _parse_imu(chunk)
+            latest_sample = _parse_imu(last_chunk)
         elif kind_id == 1:
-            sample = _parse_baro(chunk)
+            latest_sample = _parse_baro(last_chunk)
         elif kind_id == 2:
-            sample = _parse_mag(chunk)
+            latest_sample = _parse_mag(last_chunk)
         elif kind_id == 3:
-            sample = _parse_gps(chunk)
+            latest_sample = _parse_gps(last_chunk)
         else:
-            sample = _parse_system(chunk)
-        samples.append(sample)
+            latest_sample = _parse_system(last_chunk)
 
     return {
         "kind_id": kind_id,
         "kind": kind_name,
         "count": count,
+        "available": available,
         "sample_len": sample_len,
-        "samples": samples,
+        "latest_sample": latest_sample,
         "truncated": truncated,
     }
 
@@ -240,14 +235,7 @@ def extract_realtime_metrics(packet_name: str, fields: dict[str, Any]) -> dict[s
         return {}
 
     burst_kind = fields.get("kind")
-    samples = fields.get("samples")
-    if not isinstance(samples, list) or not samples:
-        return {
-            "burst_kind": burst_kind,
-            "burst_count": fields.get("count"),
-        }
-
-    latest = samples[-1]
+    latest = fields.get("latest_sample")
     if not isinstance(latest, dict):
         return {
             "burst_kind": burst_kind,

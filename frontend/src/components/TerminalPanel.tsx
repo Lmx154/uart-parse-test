@@ -1,3 +1,5 @@
+import { useMemo } from 'react';
+
 interface TerminalPanelProps {
   lines: string[];
   onClear: () => void;
@@ -9,6 +11,8 @@ export default function TerminalPanel({
   onClear,
   title = 'TELEMETRY TERMINAL'
 }: TerminalPanelProps) {
+  const renderedText = useMemo(() => lines.join('\n'), [lines]);
+
   return (
     <div className="border border-orange-500/40 rounded-lg bg-black/40 backdrop-blur-sm h-[420px] flex flex-col">
       <div className="flex items-center justify-between px-4 py-3 border-b border-orange-500/20">
@@ -26,7 +30,7 @@ export default function TerminalPanel({
         {lines.length === 0 ? (
           <div className="text-gray-500">Waiting for telemetry stream...</div>
         ) : (
-          lines.map((line, index) => <div key={`${line}-${index}`}>{line}</div>)
+          <pre className="whitespace-pre-wrap break-words m-0 leading-5">{renderedText}</pre>
         )}
       </div>
     </div>

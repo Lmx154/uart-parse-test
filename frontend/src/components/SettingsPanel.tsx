@@ -3,20 +3,41 @@ interface SerialPortOption {
   label: string;
 }
 
+interface DiagnosticsSnapshot {
+  wsPacketsPerSec: number;
+  telemetryProcessedPerSec: number;
+  telemetryCommitsPerSec: number;
+  terminalCommitsPerSec: number;
+  terminalBufferedLines: number;
+  terminalPacketLogsDroppedPerSec: number;
+  msSinceLastPacket: number | null;
+  backendQueueDepth: number;
+  backendQueueDropped: number;
+}
+
 interface SettingsPanelProps {
   theme: 'dark' | 'light';
   units: 'metric' | 'imperial';
   ports: SerialPortOption[];
   selectedPort: string;
   selectedBaudrate: number;
+  selectedSerialTimeoutMs: number | null;
   historyPointLimit: number;
+  processTelemetryUi: boolean;
+  renderDataLabCharts: boolean;
+  terminalPacketLoggingEnabled: boolean;
+  diagnostics: DiagnosticsSnapshot;
   isOpen: boolean;
   isBusy: boolean;
   onThemeChange: (theme: 'dark' | 'light') => void;
   onUnitsChange: (units: 'metric' | 'imperial') => void;
   onPortChange: (port: string) => void;
   onBaudrateChange: (baudrate: number) => void;
+  onSerialTimeoutChange: (timeoutMs: number | null) => void;
   onHistoryPointLimitChange: (points: number) => void;
+  onProcessTelemetryUiChange: (enabled: boolean) => void;
+  onRenderDataLabChartsChange: (enabled: boolean) => void;
+  onTerminalPacketLoggingEnabledChange: (enabled: boolean) => void;
   onRefreshPorts: () => void;
   onToggleConnection: () => void;
 }
@@ -27,14 +48,23 @@ export default function SettingsPanel({
   ports,
   selectedPort,
   selectedBaudrate,
+  selectedSerialTimeoutMs,
   historyPointLimit,
+  processTelemetryUi,
+  renderDataLabCharts,
+  terminalPacketLoggingEnabled,
+  diagnostics,
   isOpen,
   isBusy,
   onThemeChange,
   onUnitsChange,
   onPortChange,
   onBaudrateChange,
+  onSerialTimeoutChange,
   onHistoryPointLimitChange,
+  onProcessTelemetryUiChange,
+  onRenderDataLabChartsChange,
+  onTerminalPacketLoggingEnabledChange,
   onRefreshPorts,
   onToggleConnection,
 }: SettingsPanelProps) {
@@ -67,6 +97,22 @@ export default function SettingsPanel({
               </option>
             ))}
           </select>
+          <select
+            value={selectedSerialTimeoutMs === null ? 'none' : String(selectedSerialTimeoutMs)}
+            onChange={(event) => {
+              const value = event.target.value;
+              onSerialTimeoutChange(value === 'none' ? null : Number(value));
+            }}
+            disabled={isOpen}
+            className="w-40 bg-black/40 border border-gray-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <option value="none">timeout: never</option>
+            {[50, 100, 200, 500, 1000, 2000, 5000].map((timeoutMs) => (
+              <option key={timeoutMs} value={timeoutMs}>
+                timeout: {timeoutMs} ms
+              </option>
+            ))}
+          </select>
           <button
             type="button"
             onClick={onRefreshPorts}
@@ -82,6 +128,9 @@ export default function SettingsPanel({
           >
             {isBusy ? 'WORKING...' : isOpen ? 'CLOSE' : 'OPEN'}
           </button>
+        </div>
+        <div className="text-[11px] text-gray-500 mt-2">
+          Use `timeout: never` to keep read calls blocking with no serial read timeout.
         </div>
       </div>
 
@@ -103,6 +152,68 @@ export default function SettingsPanel({
         </div>
         <div className="text-[11px] text-gray-500 mt-2">
           Lower values use less memory and keep the UI responsive.
+        </div>
+      </div>
+
+      <div>
+        <div className="text-gray-400 text-xs tracking-widest mb-3">DIAGNOSTICS</div>
+        <div className="space-y-3">
+          <label className="flex items-center justify-between gap-3 text-sm">
+            <span className="text-gray-300">Process telemetry for UI</span>
+            <input
+              type="checkbox"
+              checked={processTelemetryUi}
+              onChange={(event) => onProcessTelemetryUiChange(event.target.checked)}
+              className="h-4 w-4 accent-orange-500"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3 text-sm">
+            <span className="text-gray-300">Render Data Lab charts</span>
+            <input
+              type="checkbox"
+              checked={renderDataLabCharts}
+              onChange={(event) => onRenderDataLabChartsChange(event.target.checked)}
+              className="h-4 w-4 accent-orange-500"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3 text-sm">
+            <span className="text-gray-300">Terminal packet logging</span>
+            <input
+              type="checkbox"
+              checked={terminalPacketLoggingEnabled}
+              onChange={(event) => onTerminalPacketLoggingEnabledChange(event.target.checked)}
+              className="h-4 w-4 accent-orange-500"
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              WS pkt/s: {diagnostics.wsPacketsPerSec}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Telemetry pkt/s: {diagnostics.telemetryProcessedPerSec}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Telemetry commits/s: {diagnostics.telemetryCommitsPerSec}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Terminal commits/s: {diagnostics.terminalCommitsPerSec}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Terminal lines: {diagnostics.terminalBufferedLines}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Terminal drops/s: {diagnostics.terminalPacketLogsDroppedPerSec}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Last packet: {diagnostics.msSinceLastPacket === null ? '--' : `${diagnostics.msSinceLastPacket} ms`}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Queue depth: {diagnostics.backendQueueDepth}
+            </div>
+            <div className="border border-gray-700 rounded px-2 py-1 text-gray-300">
+              Queue dropped: {diagnostics.backendQueueDropped}
+            </div>
+          </div>
         </div>
       </div>
 
