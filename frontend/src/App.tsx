@@ -11,13 +11,16 @@ import SystemStatus from './components/SystemStatus';
 import TerminalPanel from './components/TerminalPanel';
 import SettingsPanel from './components/SettingsPanel';
 import RealtimeGraphBuilder, { type TelemetrySample } from './components/RealtimeGraphBuilder';
+import ParametersPanel from './components/ParametersPanel';
 import {
   closeSerialPort,
+  getMavlinkParameters,
   getSerialPorts,
   getSerialStatus,
   getTelemetryWebSocketUrl,
   openSerialPort,
   writeSerialCommand,
+  type MavlinkParameter,
   type PortOption,
   type SerialStatus,
 } from './services/api';
@@ -34,7 +37,10 @@ const timelineStages = [
 
 type AppTheme = 'dark' | 'light';
 type Units = 'metric' | 'imperial';
-type TabId = 'dashboard' | 'data' | 'terminal' | 'command' | 'settings';
+type VehicleType = 'rocket' | 'drone';
+type DeviceType = 'gs' | 'fc';
+type VelocitySource = 'baro' | 'imu_z_instant';
+type TabId = 'dashboard' | 'data' | 'parameters' | 'terminal' | 'command' | 'settings';
 
 interface DiagnosticsSnapshot {
   wsPacketsPerSec: number;
@@ -77,6 +83,8 @@ interface TelemetryEvent {
 }
 
 const MAX_TERMINAL_LINES = 220;
+const DEVICE_TYPE_STORAGE_KEY = 'dashboard-device-type';
+const VEHICLE_TYPE_STORAGE_KEY = 'dashboard-vehicle-type';
 const BAUDRATE_STORAGE_KEY = 'dashboard-baudrate';
 const SERIAL_TIMEOUT_STORAGE_KEY = 'dashboard-serial-timeout-ms';
 const HISTORY_POINTS_STORAGE_KEY = 'dashboard-history-points';
@@ -85,10 +93,16 @@ const RENDER_DATALAB_CHARTS_STORAGE_KEY = 'dashboard-render-datalab-charts';
 const TERMINAL_PACKET_LOGGING_STORAGE_KEY = 'dashboard-terminal-packet-logging';
 const DEFAULT_HISTORY_POINT_LIMIT = 10;
 const MIN_HISTORY_POINT_LIMIT = 2;
-const TELEMETRY_COMMIT_INTERVAL_MS = 50;
+const TELEMETRY_COMMIT_INTERVAL_MS = 20;
 const TERMINAL_COMMIT_INTERVAL_MS = 100;
 const TERMINAL_PACKET_LOG_LIMIT_PER_SEC = 15;
 const GS_COMMANDS = ['ARM', 'DISARM', 'RTL', 'HOLD'] as const;
+const VELOCITY_SOURCE: VelocitySource = 'imu_z_instant';
+const BMI088_ACCEL_COUNTS_PER_G = 5460;
+const GRAVITY_MPS2 = 9.80665;
+const IMU_GRAVITY_CALIBRATION_SAMPLE_COUNT = 12;
+const IMU_ACCEL_DEADBAND_MPS2 = 0.15;
+const IMU_INSTANT_VELOCITY_TAU_S = 0.35;
 
 const createInitialTelemetry = (): TelemetryState => ({
   missionTime: 0,
@@ -184,6 +198,14 @@ const determineStageIndex = (
 
 function App() {
   const [activeTab, setActiveTab] = useState<TabId>('dashboard');
+  const [deviceType, setDeviceType] = useState<DeviceType>(() => {
+    const saved = localStorage.getItem(DEVICE_TYPE_STORAGE_KEY);
+    return saved === 'fc' ? 'fc' : 'gs';
+  });
+  const [vehicleType, setVehicleType] = useState<VehicleType>(() => {
+    const saved = localStorage.getItem(VEHICLE_TYPE_STORAGE_KEY);
+    return saved === 'drone' ? 'drone' : 'rocket';
+  });
   const [theme, setTheme] = useState<AppTheme>(() => {
     const saved = localStorage.getItem('dashboard-theme');
     return saved === 'light' ? 'light' : 'dark';
@@ -239,6 +261,11 @@ function App() {
     frames: 0,
   });
   const [commandHex, setCommandHex] = useState('');
+  const [parameters, setParameters] = useState<MavlinkParameter[]>([]);
+  const [parametersLoading, setParametersLoading] = useState(false);
+  const [parametersError, setParametersError] = useState<string | null>(null);
+  const [parametersExpected, setParametersExpected] = useState<number | null>(null);
+  const [parametersElapsedMs, setParametersElapsedMs] = useState<number | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot>({
     wsPacketsPerSec: 0,
     telemetryProcessedPerSec: 0,
@@ -253,8 +280,12 @@ function App() {
 
   const missionStartTsRef = useRef<number | null>(null);
   const previousAltitudeRef = useRef<number | null>(null);
-  const previousTelemetryTsRef = useRef<number | null>(null);
+  const previousVelocityTsRef = useRef<number | null>(null);
   const previousVelocityRef = useRef(0);
+  const latestAccelZRawRef = useRef<number | null>(null);
+  const imuGravityRefRawRef = useRef<number | null>(null);
+  const imuGravityCalibSumRef = useRef(0);
+  const imuGravityCalibCountRef = useRef(0);
   const lastTelemetryProcessTsRef = useRef<number | null>(null);
   const lastHistorySampleTsRef = useRef<number | null>(null);
   const historyPointLimitRef = useRef(historyPointLimit);
@@ -403,6 +434,26 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem(DEVICE_TYPE_STORAGE_KEY, deviceType);
+  }, [deviceType]);
+
+  useEffect(() => {
+    localStorage.setItem(VEHICLE_TYPE_STORAGE_KEY, vehicleType);
+  }, [vehicleType]);
+
+  useEffect(() => {
+    if (deviceType !== 'fc') {
+      setParameters([]);
+      setParametersExpected(null);
+      setParametersElapsedMs(null);
+      setParametersError(null);
+      if (activeTab === 'parameters') {
+        setActiveTab('dashboard');
+      }
+    }
+  }, [deviceType, activeTab]);
 
   useEffect(() => {
     localStorage.setItem('dashboard-theme', theme);
@@ -633,6 +684,12 @@ function App() {
           const line = `[f${packet.frame ?? '-'}] ${packet.packet_name ?? 'PACKET'} ${packet.decoded ?? ''}`.trim();
           logPacketLine(line);
 
+          const telemetryFields = packet.telemetry;
+          const latestAccelZRaw = extractNumericField(telemetryFields, 'accel_z');
+          if (latestAccelZRaw !== null) {
+            latestAccelZRawRef.current = latestAccelZRaw;
+          }
+
           const shouldProcessTelemetry =
             lastTelemetryProcessTsRef.current === null ||
             timestamp - lastTelemetryProcessTsRef.current >= TELEMETRY_COMMIT_INTERVAL_MS / 1000;
@@ -645,13 +702,10 @@ function App() {
           lastTelemetryProcessTsRef.current = timestamp;
           telemetryProcessedTotalRef.current += 1;
 
-          const telemetryFields = packet.telemetry;
           const nextBatteryMv =
             extractNumericField(telemetryFields, 'battery_mv') ?? extractNumber(packet.decoded, 'vbat_mv');
           const uplinkRssi =
             extractNumericField(telemetryFields, 'rssi_uplink_dbm') ?? extractNumber(packet.decoded, 'rssi_uplink');
-          const gpsAltitudeMeters = extractNumericField(telemetryFields, 'alt_m');
-          const gpsAltitudeMm = extractNumericField(telemetryFields, 'alt_mm') ?? extractNumber(packet.decoded, 'alt_mm');
           const pressurePa =
             extractNumericField(telemetryFields, 'pressure_pa') ?? extractNumber(packet.decoded, 'pressure_pa');
           const parsedBattery =
@@ -661,36 +715,72 @@ function App() {
           const parsedWireless = uplinkRssi !== null ? mapRssiToPercent(uplinkRssi) : null;
 
           let resolvedAltitude: number | null = null;
-          if (gpsAltitudeMeters !== null) {
-            resolvedAltitude = gpsAltitudeMeters;
-          } else if (gpsAltitudeMm !== null) {
-            resolvedAltitude = gpsAltitudeMm / 1000;
-          } else if (pressurePa !== null) {
-            resolvedAltitude = pressureToAltitudeMeters(pressurePa);
+          if (pressurePa !== null) {
+            const fromPressure = pressureToAltitudeMeters(pressurePa);
+            resolvedAltitude = Number.isFinite(fromPressure) ? fromPressure : null;
           }
 
           let resolvedVelocity = previousVelocityRef.current;
           let resolvedAcceleration = 0;
+          const previousVelocity = previousVelocityRef.current;
+          const velocityDt = previousVelocityTsRef.current === null ? null : timestamp - previousVelocityTsRef.current;
 
-          if (
+          if (VELOCITY_SOURCE === 'imu_z_instant') {
+            const accelZRaw = latestAccelZRawRef.current;
+            if (accelZRaw !== null) {
+              if (
+                imuGravityRefRawRef.current === null &&
+                imuGravityCalibCountRef.current < IMU_GRAVITY_CALIBRATION_SAMPLE_COUNT
+              ) {
+                imuGravityCalibSumRef.current += accelZRaw;
+                imuGravityCalibCountRef.current += 1;
+                if (imuGravityCalibCountRef.current >= IMU_GRAVITY_CALIBRATION_SAMPLE_COUNT) {
+                  imuGravityRefRawRef.current = imuGravityCalibSumRef.current / imuGravityCalibCountRef.current;
+                }
+              }
+
+              const gravityRefRaw = imuGravityRefRawRef.current;
+              if (gravityRefRaw !== null) {
+                let netAccelMps2 = ((accelZRaw - gravityRefRaw) / BMI088_ACCEL_COUNTS_PER_G) * GRAVITY_MPS2;
+                if (Math.abs(netAccelMps2) < IMU_ACCEL_DEADBAND_MPS2) {
+                  netAccelMps2 = 0;
+                }
+
+                resolvedAcceleration = netAccelMps2;
+                const instantVelocity = netAccelMps2 * IMU_INSTANT_VELOCITY_TAU_S;
+                if (Number.isFinite(instantVelocity)) {
+                  resolvedVelocity = instantVelocity;
+                }
+
+                if (Math.abs(netAccelMps2) < IMU_ACCEL_DEADBAND_MPS2 * 0.5) {
+                  imuGravityRefRawRef.current = gravityRefRaw * 0.995 + accelZRaw * 0.005;
+                }
+              }
+            }
+          } else if (
             resolvedAltitude !== null &&
             previousAltitudeRef.current !== null &&
-            previousTelemetryTsRef.current !== null
+            velocityDt !== null &&
+            velocityDt > 0
           ) {
-            const dt = timestamp - previousTelemetryTsRef.current;
-            if (dt > 0) {
-              resolvedVelocity = (resolvedAltitude - previousAltitudeRef.current) / dt;
-              resolvedAcceleration = (resolvedVelocity - previousVelocityRef.current) / dt;
+            const rawVelocity = (resolvedAltitude - previousAltitudeRef.current) / velocityDt;
+            if (Number.isFinite(rawVelocity)) {
+              resolvedVelocity = rawVelocity;
             }
+            resolvedAcceleration = (resolvedVelocity - previousVelocity) / velocityDt;
           }
 
           setCurrentStageIndex((stage) =>
             determineStageIndex(stage, previousVelocityRef.current, resolvedVelocity, resolvedAcceleration, timeSinceLaunch)
           );
 
-          previousTelemetryTsRef.current = timestamp;
           if (resolvedAltitude !== null) {
             previousAltitudeRef.current = resolvedAltitude;
+          }
+          if (VELOCITY_SOURCE === 'imu_z_instant') {
+            previousVelocityTsRef.current = timestamp;
+          } else if (resolvedAltitude !== null) {
+            previousVelocityTsRef.current = timestamp;
           }
           previousVelocityRef.current = resolvedVelocity;
 
@@ -810,8 +900,12 @@ function App() {
   const resetTelemetrySession = () => {
     missionStartTsRef.current = null;
     previousAltitudeRef.current = null;
-    previousTelemetryTsRef.current = null;
+    previousVelocityTsRef.current = null;
     previousVelocityRef.current = 0;
+    latestAccelZRawRef.current = null;
+    imuGravityRefRawRef.current = null;
+    imuGravityCalibSumRef.current = 0;
+    imuGravityCalibCountRef.current = 0;
     lastTelemetryProcessTsRef.current = null;
     lastHistorySampleTsRef.current = null;
     terminalPacketLogWindowStartRef.current = performance.now();
@@ -893,6 +987,43 @@ function App() {
     }
   };
 
+  const loadParameters = async () => {
+    if (deviceType !== 'fc') {
+      setParametersError('Set device to FC to load parameters.');
+      return;
+    }
+    if (!serialStatus.is_open) {
+      setParametersError('Open the serial link before loading parameters.');
+      return;
+    }
+
+    try {
+      setParametersLoading(true);
+      setParametersError(null);
+      const payload = await getMavlinkParameters(12);
+      setParameters(payload.parameters);
+      setParametersExpected(payload.expected);
+      setParametersElapsedMs(payload.elapsed_ms);
+      logTerminalLine(`[params] Loaded ${payload.received}${payload.expected === null ? '' : `/${payload.expected}`}`);
+    } catch (error) {
+      const detail = error instanceof Error && error.message ? error.message : 'Failed to load MAVLink parameters';
+      setParametersError(detail);
+      logTerminalLine(`[params] ${detail}`);
+    } finally {
+      setParametersLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (deviceType !== 'fc' || activeTab !== 'parameters') {
+      return;
+    }
+    if (parameters.length > 0 || parametersLoading) {
+      return;
+    }
+    void loadParameters();
+  }, [deviceType, activeTab, serialStatus.is_open]);
+
   return (
     <div
       className={`min-h-screen overflow-hidden relative transition-colors ${
@@ -910,7 +1041,7 @@ function App() {
         }}
       />
 
-      <TopNav activeTab={activeTab} onTabChange={(tab) => setActiveTab(tab as TabId)} />
+      <TopNav activeTab={activeTab} onTabChange={(tab) => setActiveTab(tab as TabId)} deviceType={deviceType} />
 
       <div className="relative z-10 pt-32 px-8 pb-8">
         {activeTab === 'dashboard' && (
@@ -954,7 +1085,9 @@ function App() {
 
               <div className="col-span-3 space-y-6">
                 <AltitudeDisplay altitude={altitudeValue} unit={distanceUnit} data={telemetry.altitudeHistory} />
-                <ApogeeDisplay apogee={apogeeValue} unit={distanceUnit} data={telemetry.altitudeHistory} />
+                {vehicleType === 'rocket' ? (
+                  <ApogeeDisplay apogee={apogeeValue} unit={distanceUnit} data={telemetry.altitudeHistory} />
+                ) : null}
                 <SystemStatus
                   primaryStatus={serialStatus.is_open ? 'LINK OPEN' : 'STANDBY'}
                   secondaryStatus={isStreamConnected ? 'STREAMING' : 'NO STREAM'}
@@ -962,13 +1095,15 @@ function App() {
               </div>
             </div>
 
-            <div>
-              <FlightTimeline
-                currentTime={telemetry.missionTime}
-                currentStageIndex={currentStageIndex}
-                stages={timelineStages}
-              />
-            </div>
+            {vehicleType === 'rocket' ? (
+              <div>
+                <FlightTimeline
+                  currentTime={telemetry.missionTime}
+                  currentStageIndex={currentStageIndex}
+                  stages={timelineStages}
+                />
+              </div>
+            ) : null}
           </div>
         )}
 
@@ -996,6 +1131,31 @@ function App() {
                 <div className="text-xl font-bold tracking-wide mb-2">CHART RENDERING DISABLED</div>
                 <div className="text-sm text-gray-400">
                   Data ingestion remains active; only graph rendering is disabled for diagnostics.
+                </div>
+              </div>
+            </div>
+          ))}
+
+        {activeTab === 'parameters' &&
+          (deviceType === 'fc' ? (
+            <ParametersPanel
+              parameters={parameters}
+              isLoading={parametersLoading}
+              error={parametersError}
+              expectedCount={parametersExpected}
+              receivedCount={parameters.length}
+              elapsedMs={parametersElapsedMs}
+              onRefresh={() => {
+                void loadParameters();
+              }}
+            />
+          ) : (
+            <div className="max-w-[1800px] mx-auto">
+              <div className="border border-orange-500/40 rounded-lg p-6 bg-black/40 backdrop-blur-sm">
+                <div className="text-gray-400 text-xs tracking-widest mb-2">PARAMETERS</div>
+                <div className="text-xl font-bold tracking-wide mb-2">FC DEVICE REQUIRED</div>
+                <div className="text-sm text-gray-400">
+                  Set device to FC in Settings to access MAVLink parameters.
                 </div>
               </div>
             </div>
@@ -1036,6 +1196,8 @@ function App() {
         {activeTab === 'settings' && (
           <div className="max-w-[1800px] mx-auto">
             <SettingsPanel
+              deviceType={deviceType}
+              vehicleType={vehicleType}
               theme={theme}
               units={units}
               ports={ports}
@@ -1049,6 +1211,8 @@ function App() {
               diagnostics={diagnostics}
               isOpen={serialStatus.is_open}
               isBusy={connectionBusy}
+              onDeviceTypeChange={setDeviceType}
+              onVehicleTypeChange={setVehicleType}
               onThemeChange={setTheme}
               onUnitsChange={setUnits}
               onPortChange={setSelectedPort}

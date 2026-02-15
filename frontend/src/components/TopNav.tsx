@@ -1,19 +1,21 @@
-import { BarChart3, LayoutDashboard, Terminal, User, Settings } from 'lucide-react';
-
-const tabs = [
-  { id: 'dashboard', label: 'DASHBOARD', icon: LayoutDashboard },
-  { id: 'data', label: 'DATA', icon: BarChart3 },
-  { id: 'terminal', label: 'TERMINAL', icon: Terminal },
-  { id: 'command', label: 'COMMAND', icon: User },
-  { id: 'settings', label: 'SETTINGS', icon: Settings },
-];
+import { BarChart3, LayoutDashboard, Terminal, User, Settings, SlidersHorizontal } from 'lucide-react';
 
 interface TopNavProps {
   activeTab: string;
   onTabChange: (tabId: string) => void;
+  deviceType: 'gs' | 'fc';
 }
 
-export default function TopNav({ activeTab, onTabChange }: TopNavProps) {
+export default function TopNav({ activeTab, onTabChange, deviceType }: TopNavProps) {
+  const tabs = [
+    { id: 'dashboard', label: 'DASHBOARD', icon: LayoutDashboard },
+    { id: 'data', label: 'DATA', icon: BarChart3 },
+    ...(deviceType === 'fc' ? [{ id: 'parameters', label: 'PARAMETERS', icon: SlidersHorizontal }] : []),
+    { id: 'terminal', label: 'TERMINAL', icon: Terminal },
+    { id: 'command', label: 'COMMAND', icon: User },
+    { id: 'settings', label: 'SETTINGS', icon: Settings },
+  ];
+
   return (
     <div className="absolute top-0 left-0 right-0 z-50">
       <div className="text-center py-2 text-gray-400 text-sm tracking-widest border-b border-gray-700/50">

@@ -137,6 +137,11 @@ class SerialTelemetryService:
 
         return await future
 
+    async def fetch_mavlink_parameters(self, timeout_seconds: float = 10.0) -> dict[str, Any]:
+        if timeout_seconds <= 0:
+            raise RuntimeError("timeout_seconds must be greater than 0")
+        return await asyncio.to_thread(self._fetch_mavlink_parameters_sync, timeout_seconds)
+
     async def register_client(self, websocket: WebSocket) -> None:
         async with self._ws_lock:
             self._clients.add(websocket)
@@ -159,6 +164,16 @@ class SerialTelemetryService:
             "write_queue_depth": self._write_queue.qsize(),
             "write_queue_peak": self._write_queue_peak,
         }
+
+    def _decode_param_id(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value.rstrip("\x00")
+        if isinstance(value, bytes):
+            return value.decode("ascii", "ignore").rstrip("\x00")
+        try:
+            return bytes(value).decode("ascii", "ignore").rstrip("\x00")
+        except Exception:
+            return str(value).rstrip("\x00")
 
     def _enqueue_event(self, event: dict[str, Any]) -> None:
         # Drop oldest events if consumers fall behind, keeping memory bounded.
@@ -239,15 +254,14 @@ class SerialTelemetryService:
                     },
                 )
         finally:
-            if self._stop_event.is_set() or self._loop is None:
-                return
-            self._loop.call_soon_threadsafe(
-                self._enqueue_event,
-                {
-                    "type": "error",
-                    "message": "Serial reader stopped unexpectedly",
-                },
-            )
+            if not self._stop_event.is_set() and self._loop is not None:
+                self._loop.call_soon_threadsafe(
+                    self._enqueue_event,
+                    {
+                        "type": "error",
+                        "message": "Serial reader stopped unexpectedly",
+                    },
+                )
 
     def _fail_pending_writes(self, exc: Exception) -> None:
         while True:
@@ -257,6 +271,115 @@ class SerialTelemetryService:
                 break
             if not future.done():
                 future.set_exception(exc)
+
+    def _fetch_mavlink_parameters_sync(self, timeout_seconds: float) -> dict[str, Any]:
+        with self._serial_lock:
+            serial_conn = self._serial
+        if serial_conn is None or not serial_conn.is_open:
+            raise RuntimeError("Serial port is not open")
+
+        self._stop_event.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(1.5)
+            self._reader_thread = None
+
+        try:
+            from pymavlink import mavutil  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("MAVLink parameter loading requires pymavlink installed") from exc
+
+        start_wall = time.time()
+        old_timeout = serial_conn.timeout
+        expected_count: int | None = None
+        params: dict[str, dict[str, Any]] = {}
+        reached_expected = False
+
+        try:
+            serial_conn.timeout = 0.1
+            try:
+                serial_conn.reset_input_buffer()
+            except Exception:
+                pass
+
+            mav = mavutil.mavlink.MAVLink(serial_conn)
+            mav.send(mavutil.mavlink.MAVLink_param_request_list_message(target_system=1, target_component=1))
+
+            deadline = start_wall + timeout_seconds
+            last_update = start_wall
+            while time.time() < deadline:
+                try:
+                    waiting = int(serial_conn.in_waiting)
+                except Exception:
+                    waiting = 0
+
+                chunk = serial_conn.read(waiting or 1)
+                if not chunk:
+                    if expected_count is not None and len(params) >= expected_count:
+                        break
+                    if expected_count is not None and (time.time() - last_update) > 1.0:
+                        break
+                    continue
+
+                for byte in chunk:
+                    msg = mav.parse_char(byte.to_bytes(1, "little"))
+                    if msg is None:
+                        continue
+                    if msg.get_type() != "PARAM_VALUE":
+                        continue
+
+                    name = self._decode_param_id(msg.param_id)
+                    if not name:
+                        continue
+
+                    param_value = float(msg.param_value)
+                    param_type = int(msg.param_type)
+                    param_index = int(msg.param_index)
+                    param_count = int(msg.param_count)
+
+                    params[name] = {
+                        "name": name,
+                        "value": param_value,
+                        "type": param_type,
+                        "index": param_index,
+                        "count": param_count,
+                    }
+                    if param_count > 0:
+                        expected_count = param_count
+                    last_update = time.time()
+
+                    if expected_count is not None and len(params) >= expected_count:
+                        reached_expected = True
+                        break
+
+                if reached_expected:
+                    break
+        finally:
+            try:
+                serial_conn.timeout = old_timeout
+            except Exception:
+                pass
+
+            self._stop_event.clear()
+            with self._serial_lock:
+                current_conn = self._serial
+            if current_conn is serial_conn and serial_conn.is_open and self._reader_thread is None:
+                self._reader_thread = threading.Thread(target=self._reader_loop, name="serial-reader", daemon=True)
+                self._reader_thread.start()
+
+        items = sorted(
+            params.values(),
+            key=lambda parameter: (
+                parameter["index"] if isinstance(parameter.get("index"), int) and parameter["index"] >= 0 else 1_000_000,
+                str(parameter.get("name", "")),
+            ),
+        )
+
+        return {
+            "parameters": items,
+            "received": len(items),
+            "expected": expected_count,
+            "elapsed_ms": int((time.time() - start_wall) * 1000),
+        }
 
     async def _writer_loop(self) -> None:
         try:

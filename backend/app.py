@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import re
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import serial.tools.list_ports
@@ -140,6 +140,14 @@ async def write_serial(request: WriteCommandRequest) -> dict[str, int]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {"written": written}
+
+
+@app.get("/mavlink/parameters")
+async def mavlink_parameters(timeout_s: float = Query(10.0, gt=0.1, le=60.0)) -> dict[str, object]:
+    try:
+        return await service.fetch_mavlink_parameters(timeout_seconds=timeout_s)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.websocket("/ws/telemetry")

@@ -16,6 +16,8 @@ interface DiagnosticsSnapshot {
 }
 
 interface SettingsPanelProps {
+  deviceType: 'gs' | 'fc';
+  vehicleType: 'rocket' | 'drone';
   theme: 'dark' | 'light';
   units: 'metric' | 'imperial';
   ports: SerialPortOption[];
@@ -29,6 +31,8 @@ interface SettingsPanelProps {
   diagnostics: DiagnosticsSnapshot;
   isOpen: boolean;
   isBusy: boolean;
+  onDeviceTypeChange: (deviceType: 'gs' | 'fc') => void;
+  onVehicleTypeChange: (vehicleType: 'rocket' | 'drone') => void;
   onThemeChange: (theme: 'dark' | 'light') => void;
   onUnitsChange: (units: 'metric' | 'imperial') => void;
   onPortChange: (port: string) => void;
@@ -43,6 +47,8 @@ interface SettingsPanelProps {
 }
 
 export default function SettingsPanel({
+  deviceType,
+  vehicleType,
   theme,
   units,
   ports,
@@ -56,6 +62,8 @@ export default function SettingsPanel({
   diagnostics,
   isOpen,
   isBusy,
+  onDeviceTypeChange,
+  onVehicleTypeChange,
   onThemeChange,
   onUnitsChange,
   onPortChange,
@@ -70,6 +78,62 @@ export default function SettingsPanel({
 }: SettingsPanelProps) {
   return (
     <div className="border border-orange-500/40 rounded-lg bg-black/40 backdrop-blur-sm p-5 space-y-6">
+      <div>
+        <div className="text-gray-400 text-xs tracking-widest mb-3">DEVICE</div>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onDeviceTypeChange('gs')}
+            className={`px-3 py-2 text-xs font-semibold tracking-wider rounded border transition-colors ${
+              deviceType === 'gs'
+                ? 'border-orange-500 text-orange-500 bg-orange-500/20'
+                : 'border-gray-700 text-gray-300 hover:border-orange-500 hover:text-orange-500'
+            }`}
+          >
+            GS
+          </button>
+          <button
+            type="button"
+            onClick={() => onDeviceTypeChange('fc')}
+            className={`px-3 py-2 text-xs font-semibold tracking-wider rounded border transition-colors ${
+              deviceType === 'fc'
+                ? 'border-orange-500 text-orange-500 bg-orange-500/20'
+                : 'border-gray-700 text-gray-300 hover:border-orange-500 hover:text-orange-500'
+            }`}
+          >
+            FC
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-gray-400 text-xs tracking-widest mb-3">VEHICLE TYPE</div>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onVehicleTypeChange('rocket')}
+            className={`px-3 py-2 text-xs font-semibold tracking-wider rounded border transition-colors ${
+              vehicleType === 'rocket'
+                ? 'border-orange-500 text-orange-500 bg-orange-500/20'
+                : 'border-gray-700 text-gray-300 hover:border-orange-500 hover:text-orange-500'
+            }`}
+          >
+            ROCKET
+          </button>
+          <button
+            type="button"
+            onClick={() => onVehicleTypeChange('drone')}
+            className={`px-3 py-2 text-xs font-semibold tracking-wider rounded border transition-colors ${
+              vehicleType === 'drone'
+                ? 'border-orange-500 text-orange-500 bg-orange-500/20'
+                : 'border-gray-700 text-gray-300 hover:border-orange-500 hover:text-orange-500'
+            }`}
+          >
+            DRONE
+          </button>
+        </div>
+      </div>
+
       <div>
         <div className="text-gray-400 text-xs tracking-widest mb-3">CONNECTION</div>
         <div className="flex items-center gap-3">

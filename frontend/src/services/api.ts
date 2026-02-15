@@ -17,6 +17,21 @@ export interface PortOption {
   label: string;
 }
 
+export interface MavlinkParameter {
+  name: string;
+  value: number;
+  type: number;
+  index: number;
+  count: number;
+}
+
+export interface MavlinkParametersResponse {
+  parameters: MavlinkParameter[];
+  received: number;
+  expected: number | null;
+  elapsed_ms: number;
+}
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
 
 const SERIAL_ENDPOINTS = {
@@ -25,6 +40,7 @@ const SERIAL_ENDPOINTS = {
   open: '/serial/open',
   close: '/serial/close',
   write: '/serial/write',
+  mavlinkParameters: '/mavlink/parameters',
 };
 
 const buildUrl = (path: string) => `${API_BASE_URL}${path}`;
@@ -113,4 +129,23 @@ export const writeSerialCommand = async (command: string) => {
   }
   const payload = (await response.json()) as { written: number };
   return payload.written;
+};
+
+export const getMavlinkParameters = async (timeoutSeconds = 10) => {
+  const response = await fetch(
+    `${buildUrl(SERIAL_ENDPOINTS.mavlinkParameters)}?timeout_s=${encodeURIComponent(timeoutSeconds)}`
+  );
+  if (!response.ok) {
+    let detail = 'Failed to load MAVLink parameters';
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      if (typeof payload.detail === 'string' && payload.detail.trim()) {
+        detail = payload.detail.trim();
+      }
+    } catch {
+      // Keep fallback detail.
+    }
+    throw new Error(detail);
+  }
+  return (await response.json()) as MavlinkParametersResponse;
 };
