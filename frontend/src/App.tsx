@@ -1053,6 +1053,9 @@ function App() {
                   gyroX={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.gyroX ?? null}
                   gyroY={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.gyroY ?? null}
                   gyroZ={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.gyroZ ?? null}
+                  accelX={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.accelX ?? null}
+                  accelY={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.accelY ?? null}
+                  accelZ={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.accelZ ?? null}
                 />
                 <WirelessLink strength={telemetry.wireless} />
                 <BatteryDisplay level={telemetry.battery} />

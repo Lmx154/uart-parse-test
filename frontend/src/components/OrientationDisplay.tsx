@@ -8,16 +8,96 @@ interface OrientationDisplayProps {
   gyroX: number | null;
   gyroY: number | null;
   gyroZ: number | null;
+  accelX: number | null;
+  accelY: number | null;
+  accelZ: number | null;
 }
 
-const MAX_ROTATION_RAD = Math.PI / 2;
-const GYRO_TO_RAD = 0.003;
+const ACCEL_G_PER_LSB = 1 / 5460.0;
+const GYRO_DPS_PER_LSB = 1 / 16.4;
+const GYRO_RADPS_PER_LSB = (Math.PI / 180.0) / 16.4;
+const GYRO_DEADBAND_DPS = 0.35;
+const ACCEL_LPF_ALPHA = 0.24;
+const VISUAL_SLERP = 0.55;
+const ACCEL_TRUST_MIN = 0.08;
+const KALMAN_Q_ANGLE = 0.008;
+const KALMAN_Q_BIAS = 0.0025;
+const KALMAN_R_MEASURE = 0.04;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const angleDelta = (a: number, b: number) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
 
-const toRadiansFromGyro = (value: number | null) => clamp((value ?? 0) * GYRO_TO_RAD, -MAX_ROTATION_RAD, MAX_ROTATION_RAD);
+interface KalmanAngleState {
+  angle: number;
+  bias: number;
+  p00: number;
+  p01: number;
+  p10: number;
+  p11: number;
+  initialized: boolean;
+}
 
-export default function OrientationDisplay({ gyroX, gyroY, gyroZ }: OrientationDisplayProps) {
+const createKalmanState = (): KalmanAngleState => ({
+  angle: 0,
+  bias: 0,
+  p00: 1,
+  p01: 0,
+  p10: 0,
+  p11: 1,
+  initialized: false,
+});
+
+const updateKalmanAngle = (
+  state: KalmanAngleState,
+  measuredAngleRad: number,
+  measuredRateRadPerSec: number,
+  dtSeconds: number,
+  qAngle: number,
+  qBias: number,
+  rMeasure: number
+) => {
+  if (!state.initialized) {
+    state.angle = measuredAngleRad;
+    state.bias = 0;
+    state.initialized = true;
+    return state.angle;
+  }
+
+  const rate = measuredRateRadPerSec - state.bias;
+  state.angle += dtSeconds * rate;
+
+  state.p00 += dtSeconds * (dtSeconds * state.p11 - state.p01 - state.p10 + qAngle);
+  state.p01 -= dtSeconds * state.p11;
+  state.p10 -= dtSeconds * state.p11;
+  state.p11 += qBias * dtSeconds;
+
+  const innovation = angleDelta(measuredAngleRad, state.angle);
+  const s = state.p00 + rMeasure;
+  const k0 = state.p00 / s;
+  const k1 = state.p10 / s;
+
+  state.angle += k0 * innovation;
+  state.bias += k1 * innovation;
+
+  const p00Temp = state.p00;
+  const p01Temp = state.p01;
+  state.p00 -= k0 * p00Temp;
+  state.p01 -= k0 * p01Temp;
+  state.p10 -= k1 * p00Temp;
+  state.p11 -= k1 * p01Temp;
+
+  state.angle = Math.atan2(Math.sin(state.angle), Math.cos(state.angle));
+  return state.angle;
+};
+
+export default function OrientationDisplay({
+  gyroX,
+  gyroY,
+  gyroZ,
+  accelX,
+  accelY,
+  accelZ,
+}: OrientationDisplayProps) {
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const vehicleRef = useRef<THREE.Group | null>(null);
   const gridRef = useRef<THREE.GridHelper | null>(null);
@@ -27,7 +107,16 @@ export default function OrientationDisplay({ gyroX, gyroY, gyroZ }: OrientationD
   const cameraTargetRef = useRef(new THREE.Vector3(0, 0, 0.15));
   const cameraBaseDistanceRef = useRef(4.3);
   const zoomPercentRef = useRef(100);
-  const targetRotationRef = useRef(new THREE.Vector3());
+  const zOffsetDegRef = useRef(0);
+  const gyroInputRef = useRef(new THREE.Vector3(0, 0, 0));
+  const accelInputRef = useRef(new THREE.Vector3(0, 0, 1));
+  const accelFilteredRef = useRef(new THREE.Vector3(0, 0, 1));
+  const kalmanRollRef = useRef<KalmanAngleState>(createKalmanState());
+  const kalmanPitchRef = useRef<KalmanAngleState>(createKalmanState());
+  const yawRadRef = useRef(0);
+  const filterTargetQuatRef = useRef(new THREE.Quaternion());
+  const filterEulerRef = useRef(new THREE.Euler(0, 0, 0, 'ZYX'));
+  const lastFilterMsRef = useRef<number | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const [zOffsetDeg, setZOffsetDeg] = useState(0);
   const [optionsOpen, setOptionsOpen] = useState(false);
@@ -75,6 +164,11 @@ export default function OrientationDisplay({ gyroX, gyroY, gyroZ }: OrientationD
     vehicleGroup.rotation.order = 'ZYX';
     scene.add(vehicleGroup);
     vehicleRef.current = vehicleGroup;
+    kalmanRollRef.current = createKalmanState();
+    kalmanPitchRef.current = createKalmanState();
+    yawRadRef.current = 0;
+    filterTargetQuatRef.current.identity();
+    lastFilterMsRef.current = performance.now();
 
     const localAxes = new THREE.AxesHelper(0.9);
     localAxes.visible = showAxesLegend;
@@ -181,9 +275,85 @@ export default function OrientationDisplay({ gyroX, gyroY, gyroZ }: OrientationD
     const animate = () => {
       const vehicle = vehicleRef.current;
       if (vehicle) {
-        vehicle.rotation.x += (targetRotationRef.current.x - vehicle.rotation.x) * 0.14;
-        vehicle.rotation.y += (targetRotationRef.current.y - vehicle.rotation.y) * 0.14;
-        vehicle.rotation.z += (targetRotationRef.current.z - vehicle.rotation.z) * 0.14;
+        const now = performance.now();
+        const prev = lastFilterMsRef.current ?? now;
+        const dt = clamp((now - prev) / 1000, 0.001, 0.05);
+        lastFilterMsRef.current = now;
+
+        accelFilteredRef.current.lerp(accelInputRef.current, ACCEL_LPF_ALPHA);
+
+        let gxDps = gyroInputRef.current.x * GYRO_DPS_PER_LSB;
+        let gyDps = gyroInputRef.current.y * GYRO_DPS_PER_LSB;
+        let gzDps = gyroInputRef.current.z * GYRO_DPS_PER_LSB;
+        gxDps = Math.abs(gxDps) < GYRO_DEADBAND_DPS ? 0 : gxDps;
+        gyDps = Math.abs(gyDps) < GYRO_DEADBAND_DPS ? 0 : gyDps;
+        gzDps = Math.abs(gzDps) < GYRO_DEADBAND_DPS ? 0 : gzDps;
+
+        // Equivalent raw form from your setup:
+        // gyro_radps = raw_gyro * ((pi / 180.0) / 16.4)
+        const gxFromRaw = gyroInputRef.current.x * GYRO_RADPS_PER_LSB;
+        const gyFromRaw = gyroInputRef.current.y * GYRO_RADPS_PER_LSB;
+        const gzFromRaw = gyroInputRef.current.z * GYRO_RADPS_PER_LSB;
+        const gxRate = Math.abs(gxDps) < GYRO_DEADBAND_DPS ? 0 : gxFromRaw;
+        const gyRate = Math.abs(gyDps) < GYRO_DEADBAND_DPS ? 0 : gyFromRaw;
+        const gzRate = Math.abs(gzDps) < GYRO_DEADBAND_DPS ? 0 : gzFromRaw;
+
+        const axG = accelFilteredRef.current.x * ACCEL_G_PER_LSB;
+        const ayG = accelFilteredRef.current.y * ACCEL_G_PER_LSB;
+        const azG = accelFilteredRef.current.z * ACCEL_G_PER_LSB;
+
+        const accelMagG = Math.sqrt(axG * axG + ayG * ayG + azG * azG);
+        const hasAccelMeasurement = accelMagG > 0.15;
+
+        let roll = kalmanRollRef.current.angle + gxRate * dt;
+        let pitch = kalmanPitchRef.current.angle + gyRate * dt;
+        const accelMagSq = accelFilteredRef.current.lengthSq();
+        if (hasAccelMeasurement && accelMagSq > 0.000001) {
+          const nx = axG / accelMagG;
+          const ny = ayG / accelMagG;
+          const nz = azG / accelMagG;
+          const rollAcc = Math.atan2(ny, nz);
+          const pitchAcc = Math.atan2(-nx, Math.sqrt(ny * ny + nz * nz));
+
+          const gyroMagnitudeDps = Math.sqrt(gxDps * gxDps + gyDps * gyDps + gzDps * gzDps);
+          const accelMagError = Math.abs(accelMagG - 1);
+          const accelTrust = clamp((1 - accelMagError * 2.2) * (1 - clamp(gyroMagnitudeDps / 220, 0, 1) * 0.65), ACCEL_TRUST_MIN, 1);
+          const rMeasure = KALMAN_R_MEASURE / accelTrust;
+
+          roll = updateKalmanAngle(
+            kalmanRollRef.current,
+            rollAcc,
+            gxRate,
+            dt,
+            KALMAN_Q_ANGLE,
+            KALMAN_Q_BIAS,
+            rMeasure
+          );
+          pitch = updateKalmanAngle(
+            kalmanPitchRef.current,
+            pitchAcc,
+            gyRate,
+            dt,
+            KALMAN_Q_ANGLE,
+            KALMAN_Q_BIAS,
+            rMeasure
+          );
+        } else {
+          kalmanRollRef.current.angle = roll;
+          kalmanPitchRef.current.angle = pitch;
+        }
+
+        yawRadRef.current += gzRate * dt;
+        yawRadRef.current = Math.atan2(Math.sin(yawRadRef.current), Math.cos(yawRadRef.current));
+
+        filterEulerRef.current.set(
+          roll,
+          pitch,
+          yawRadRef.current + (zOffsetDegRef.current * Math.PI) / 180,
+          'ZYX'
+        );
+        filterTargetQuatRef.current.setFromEuler(filterEulerRef.current);
+        vehicle.quaternion.slerp(filterTargetQuatRef.current, VISUAL_SLERP);
       }
       camera.lookAt(cameraTargetRef.current);
       renderer.render(scene, camera);
@@ -216,16 +386,17 @@ export default function OrientationDisplay({ gyroX, gyroY, gyroZ }: OrientationD
       gridRef.current = null;
       localAxesRef.current = null;
       cameraRef.current = null;
+      lastFilterMsRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    targetRotationRef.current.set(
-      toRadiansFromGyro(gyroX),
-      toRadiansFromGyro(gyroY),
-      toRadiansFromGyro(gyroZ) + (zOffsetDeg * Math.PI) / 180
-    );
-  }, [gyroX, gyroY, gyroZ, zOffsetDeg]);
+    gyroInputRef.current.set(gyroX ?? 0, gyroY ?? 0, gyroZ ?? 0);
+  }, [gyroX, gyroY, gyroZ]);
+
+  useEffect(() => {
+    accelInputRef.current.set(accelX ?? 0, accelY ?? 0, accelZ ?? 1);
+  }, [accelX, accelY, accelZ]);
 
   useEffect(() => {
     if (gridRef.current) {
@@ -251,6 +422,10 @@ export default function OrientationDisplay({ gyroX, gyroY, gyroZ }: OrientationD
     camera.lookAt(cameraTargetRef.current);
     camera.updateProjectionMatrix();
   }, [zoomPercent]);
+
+  useEffect(() => {
+    zOffsetDegRef.current = zOffsetDeg;
+  }, [zOffsetDeg]);
 
   const gyroLabel = useMemo(
     () => ({
