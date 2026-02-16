@@ -60,8 +60,7 @@ interface AxisOption {
 interface GraphConfig {
   id: number;
   xKey: AxisKey;
-  yKey: AxisKey;
-  color: string;
+  yKeys: AxisKey[];
 }
 
 interface RealtimeGraphBuilderProps {
@@ -118,6 +117,30 @@ const ALL_SIGNAL_SERIES: MultiSeriesConfig[] = [
 
 const GRAPH_COLORS = ['#f97316', '#14b8a6', '#38bdf8', '#f43f5e', '#22c55e', '#eab308'];
 const FEET_PER_METER = 3.28084;
+const MAX_GRAPH_POINTS = 320;
+const MAX_Y_AXES_PER_GRAPH = 10;
+
+const SERIES_COLOR_BY_KEY: Partial<Record<AxisKey, string>> = {
+  velocity: '#14b8a6',
+  altitude: '#38bdf8',
+  apogee: '#22c55e',
+  acceleration: '#f43f5e',
+  battery: '#eab308',
+  wireless: '#84cc16',
+  accelX: '#f97316',
+  accelY: '#fb7185',
+  accelZ: '#f59e0b',
+  gyroX: '#22c55e',
+  gyroY: '#14b8a6',
+  gyroZ: '#0ea5e9',
+  magX: '#3b82f6',
+  magY: '#6366f1',
+  magZ: '#a855f7',
+  pressurePa: '#84cc16',
+  tempC: '#eab308',
+  latDeg: '#10b981',
+  lonDeg: '#38bdf8',
+};
 
 const getAxisOption = (key: AxisKey) => AXIS_OPTIONS.find((option) => option.key === key) ?? AXIS_OPTIONS[0];
 
@@ -174,13 +197,16 @@ const getAxisValue = (sample: TelemetrySample, axisKey: AxisKey, units: DataUnit
   return convertValue(rawValue, axisKey, units);
 };
 
+const getSeriesColor = (axisKey: AxisKey, fallbackIndex: number) =>
+  SERIES_COLOR_BY_KEY[axisKey] ?? GRAPH_COLORS[fallbackIndex % GRAPH_COLORS.length];
+
 export default function RealtimeGraphBuilder({
   samples,
   units,
   isStreamConnected,
 }: RealtimeGraphBuilderProps) {
   const [graphs, setGraphs] = useState<GraphConfig[]>([
-    { id: 1, xKey: 'missionTime', yKey: 'altitude', color: GRAPH_COLORS[0] },
+    { id: 1, xKey: 'missionTime', yKeys: ['altitude'] },
   ]);
   const [nextGraphId, setNextGraphId] = useState(2);
 
@@ -231,16 +257,57 @@ export default function RealtimeGraphBuilder({
       {
         id: nextGraphId,
         xKey: 'missionTime',
-        yKey: 'velocity',
-        color: GRAPH_COLORS[previous.length % GRAPH_COLORS.length],
+        yKeys: ['velocity'],
       },
     ]);
     setNextGraphId((previous) => previous + 1);
   };
 
-  const updateGraphAxis = (graphId: number, axisType: 'xKey' | 'yKey', nextAxis: AxisKey) => {
+  const updateGraphXAxis = (graphId: number, nextAxis: AxisKey) => {
     setGraphs((previous) =>
-      previous.map((graph) => (graph.id === graphId ? { ...graph, [axisType]: nextAxis } : graph))
+      previous.map((graph) => (graph.id === graphId ? { ...graph, xKey: nextAxis } : graph))
+    );
+  };
+
+  const updateGraphYAxis = (graphId: number, axisIndex: number, nextAxis: AxisKey) => {
+    setGraphs((previous) =>
+      previous.map((graph) => {
+        if (graph.id !== graphId) {
+          return graph;
+        }
+        const nextYKeys = [...graph.yKeys];
+        nextYKeys[axisIndex] = nextAxis;
+        return { ...graph, yKeys: nextYKeys };
+      })
+    );
+  };
+
+  const addGraphYAxis = (graphId: number) => {
+    setGraphs((previous) =>
+      previous.map((graph) => {
+        if (graph.id !== graphId || graph.yKeys.length >= MAX_Y_AXES_PER_GRAPH) {
+          return graph;
+        }
+        const nextOption = AXIS_OPTIONS.find((option) => !graph.yKeys.includes(option.key));
+        if (!nextOption) {
+          return graph;
+        }
+        return { ...graph, yKeys: [...graph.yKeys, nextOption.key] };
+      })
+    );
+  };
+
+  const removeGraphYAxis = (graphId: number, axisIndex: number) => {
+    setGraphs((previous) =>
+      previous.map((graph) => {
+        if (graph.id !== graphId || graph.yKeys.length <= 1) {
+          return graph;
+        }
+        return {
+          ...graph,
+          yKeys: graph.yKeys.filter((_, index) => index !== axisIndex),
+        };
+      })
     );
   };
 
@@ -261,7 +328,7 @@ export default function RealtimeGraphBuilder({
             <div className="text-gray-400 text-xs tracking-widest mb-2">DATA LAB</div>
             <h2 className="text-2xl font-bold tracking-wide">REAL-TIME GRAPH BUILDER</h2>
             <p className="text-sm text-gray-400 mt-2">
-              Build custom live plots by pairing any telemetry field on X and Y axes.
+              Build custom live plots by pairing any telemetry field on X with up to 10 Y series.
             </p>
           </div>
           <button
@@ -285,7 +352,7 @@ export default function RealtimeGraphBuilder({
           </div>
           <div className="border border-orange-500/30 rounded p-3">
             <div className="text-xs text-gray-400 tracking-wider">MISSION TIME</div>
-            <div className="font-semibold mt-1">{latest ? `${latest.missionTime.toFixed(0)} s` : '--'}</div>
+            <div className="font-semibold mt-1">{latest ? `${latest.missionTime.toFixed(1)} s` : '--'}</div>
           </div>
           <div className="border border-orange-500/30 rounded p-3">
             <div className="text-xs text-gray-400 tracking-wider">VELOCITY</div>
@@ -353,18 +420,34 @@ export default function RealtimeGraphBuilder({
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         {graphs.map((graph, index) => {
-          const points = samples
-            .map((sample) => ({
-              x: getAxisValue(sample, graph.xKey, units),
-              y: getAxisValue(sample, graph.yKey, units),
-            }))
-            .filter((point): point is { x: number; y: number } => point.x !== null && point.y !== null)
-            .slice(-320);
+          const windowSamples = samples.slice(-MAX_GRAPH_POINTS);
+          const series = graph.yKeys.map((yKey, seriesIndex) => {
+            const points = windowSamples
+              .map((sample, sampleIndex) => {
+                const xValue = getAxisValue(sample, graph.xKey, units);
+                const yValue = getAxisValue(sample, yKey, units);
+                if (xValue === null || yValue === null) {
+                  return null;
+                }
+                const adjustedX =
+                  graph.xKey === 'missionTime' ? xValue + sampleIndex * 0.0001 : xValue;
+                return { x: adjustedX, y: yValue };
+              })
+              .filter((point): point is { x: number; y: number } => point !== null);
 
-          const hasGraphData = points.length >= 2;
+            return {
+              yKey,
+              color: getSeriesColor(yKey, seriesIndex),
+              points,
+              latestPoint: points[points.length - 1] ?? null,
+            };
+          });
 
-          const xValues = points.map((point) => point.x);
-          const yValues = points.map((point) => point.y);
+          const flattenedPoints = series.flatMap((line) => line.points);
+          const hasGraphData = series.some((line) => line.points.length >= 2);
+
+          const xValues = flattenedPoints.map((point) => point.x);
+          const yValues = flattenedPoints.map((point) => point.y);
           const xMin = xValues.length ? Math.min(...xValues) : 0;
           const xMax = xValues.length ? Math.max(...xValues) : 1;
           const yMin = yValues.length ? Math.min(...yValues) : 0;
@@ -378,21 +461,28 @@ export default function RealtimeGraphBuilder({
           const minY = 8;
           const maxY = 52;
 
-          const polyline = points
-            .map((point) => {
-              const normalizedX = ((point.x - xMin) / xRange) * (maxX - minX) + minX;
-              const normalizedY = maxY - ((point.y - yMin) / yRange) * (maxY - minY);
-              return `${normalizedX.toFixed(2)},${normalizedY.toFixed(2)}`;
-            })
-            .join(' ');
+          const seriesWithPolylines = series.map((line) => {
+            const polyline = line.points
+              .map((point) => {
+                const normalizedX = ((point.x - xMin) / xRange) * (maxX - minX) + minX;
+                const normalizedY = maxY - ((point.y - yMin) / yRange) * (maxY - minY);
+                return `${normalizedX.toFixed(2)},${normalizedY.toFixed(2)}`;
+              })
+              .join(' ');
+            return {
+              ...line,
+              hasData: line.points.length >= 2,
+              polyline,
+            };
+          });
 
-          const latestPoint = points[points.length - 1];
+          const graphAccentColor = seriesWithPolylines[0]?.color ?? GRAPH_COLORS[index % GRAPH_COLORS.length];
 
           return (
             <div key={graph.id} className="border border-orange-500/40 rounded-lg p-4 bg-black/40 backdrop-blur-sm">
               <div className="flex items-center justify-between gap-3 mb-4">
                 <div className="flex items-center gap-2 text-sm font-semibold tracking-wider">
-                  <LineChart size={16} style={{ color: graph.color }} />
+                  <LineChart size={16} style={{ color: graphAccentColor }} />
                   GRAPH {index + 1}
                 </div>
                 <button
@@ -411,7 +501,7 @@ export default function RealtimeGraphBuilder({
                   <span className="text-gray-400 tracking-wider">X AXIS</span>
                   <select
                     value={graph.xKey}
-                    onChange={(event) => updateGraphAxis(graph.id, 'xKey', event.target.value as AxisKey)}
+                    onChange={(event) => updateGraphXAxis(graph.id, event.target.value as AxisKey)}
                     className="w-full bg-black/40 border border-gray-700 rounded px-2 py-2 text-sm focus:outline-none focus:border-orange-500"
                   >
                     {AXIS_OPTIONS.map((option) => (
@@ -421,20 +511,53 @@ export default function RealtimeGraphBuilder({
                     ))}
                   </select>
                 </label>
-                <label className="space-y-1">
-                  <span className="text-gray-400 tracking-wider">Y AXIS</span>
-                  <select
-                    value={graph.yKey}
-                    onChange={(event) => updateGraphAxis(graph.id, 'yKey', event.target.value as AxisKey)}
-                    className="w-full bg-black/40 border border-gray-700 rounded px-2 py-2 text-sm focus:outline-none focus:border-orange-500"
-                  >
-                    {AXIS_OPTIONS.map((option) => (
-                      <option key={option.key} value={option.key}>
-                        {getAxisLabel(option.key, units)}
-                      </option>
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-400 tracking-wider">Y AXES ({graph.yKeys.length}/{MAX_Y_AXES_PER_GRAPH})</span>
+                    <button
+                      type="button"
+                      onClick={() => addGraphYAxis(graph.id)}
+                      disabled={
+                        graph.yKeys.length >= MAX_Y_AXES_PER_GRAPH || graph.yKeys.length >= AXIS_OPTIONS.length
+                      }
+                      className="inline-flex items-center gap-1 px-2 py-1 text-[11px] tracking-wider rounded border border-orange-500/70 text-orange-300 hover:bg-orange-500/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      <Plus size={11} />
+                      ADD Y
+                    </button>
+                  </div>
+                  <div className="space-y-2">
+                    {graph.yKeys.map((yKey, axisIndex) => (
+                      <div key={`${graph.id}-${axisIndex}`} className="flex items-center gap-2">
+                        <span
+                          className="w-2 h-2 rounded-full flex-shrink-0"
+                          style={{ backgroundColor: getSeriesColor(yKey, axisIndex) }}
+                        />
+                        <select
+                          value={yKey}
+                          onChange={(event) => updateGraphYAxis(graph.id, axisIndex, event.target.value as AxisKey)}
+                          className="flex-1 bg-black/40 border border-gray-700 rounded px-2 py-2 text-sm focus:outline-none focus:border-orange-500"
+                        >
+                          {AXIS_OPTIONS.filter(
+                            (option) => option.key === yKey || !graph.yKeys.includes(option.key)
+                          ).map((option) => (
+                            <option key={option.key} value={option.key}>
+                              {getAxisLabel(option.key, units)}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => removeGraphYAxis(graph.id, axisIndex)}
+                          disabled={graph.yKeys.length <= 1}
+                          className="px-2 py-1 text-[11px] tracking-wider rounded border border-gray-600 text-gray-300 hover:border-red-500 hover:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                        >
+                          RM
+                        </button>
+                      </div>
                     ))}
-                  </select>
-                </label>
+                  </div>
+                </div>
               </div>
 
               <div className="h-64 border border-orange-500/20 rounded bg-black/30">
@@ -443,13 +566,18 @@ export default function RealtimeGraphBuilder({
                     <line x1="8" y1="8" x2="8" y2="52" stroke="rgba(148, 163, 184, 0.25)" strokeWidth="0.4" />
                     <line x1="8" y1="52" x2="92" y2="52" stroke="rgba(148, 163, 184, 0.25)" strokeWidth="0.4" />
                     <line x1="8" y1="30" x2="92" y2="30" stroke="rgba(148, 163, 184, 0.15)" strokeWidth="0.3" />
-                    <polyline
-                      points={polyline}
-                      fill="none"
-                      stroke={graph.color}
-                      strokeWidth="0.8"
-                      vectorEffect="non-scaling-stroke"
-                    />
+                    {seriesWithPolylines.map((line) =>
+                      line.hasData ? (
+                        <polyline
+                          key={`${graph.id}-${line.yKey}`}
+                          points={line.polyline}
+                          fill="none"
+                          stroke={line.color}
+                          strokeWidth="0.75"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      ) : null
+                    )}
                   </svg>
                 ) : (
                   <div className="h-full flex items-center justify-center text-sm text-gray-500">
@@ -468,13 +596,20 @@ export default function RealtimeGraphBuilder({
                 <div>
                   <div className="tracking-wider mb-1">Y RANGE</div>
                   <div className="text-gray-300">
-                    {getAxisLabel(graph.yKey, units)}: {formatNumber(yMin)} {'->'} {formatNumber(yMax)}
+                    Combined Y: {formatNumber(yMin)} {'->'} {formatNumber(yMax)}
                   </div>
                 </div>
               </div>
 
-              <div className="mt-2 text-xs text-gray-500">
-                Latest point: {latestPoint ? `(${formatNumber(latestPoint.x)}, ${formatNumber(latestPoint.y)})` : '--'}
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-500">
+                {seriesWithPolylines.map((line) => (
+                  <div key={`latest-${graph.id}-${line.yKey}`} className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: line.color }} />
+                    <span>
+                      {getAxisOption(line.yKey).label}: {formatSeriesNumber(line.yKey, line.latestPoint?.y ?? null)}
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
           );

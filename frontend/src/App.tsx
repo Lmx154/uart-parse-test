@@ -671,7 +671,7 @@ function App() {
           if (missionStartTsRef.current === null) {
             missionStartTsRef.current = timestamp;
           }
-          const timeSinceLaunch = Math.max(0, Math.round(timestamp - missionStartTsRef.current));
+          const timeSinceLaunch = Math.max(0, timestamp - missionStartTsRef.current);
 
           if (packet.type === 'error') {
             logTerminalLine(`[error] ${packet.message ?? 'Unknown serial error'}`);
@@ -1049,7 +1049,11 @@ function App() {
             <div className="grid grid-cols-12 gap-6">
               <div className="col-span-3 space-y-6">
                 <VelocityDisplay velocity={velocityValue} unit={velocityUnit} data={telemetry.velocityHistory} />
-                <OrientationDisplay />
+                <OrientationDisplay
+                  gyroX={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.gyroX ?? null}
+                  gyroY={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.gyroY ?? null}
+                  gyroZ={telemetry.sampleHistory[telemetry.sampleHistory.length - 1]?.gyroZ ?? null}
+                />
                 <WirelessLink strength={telemetry.wireless} />
                 <BatteryDisplay level={telemetry.battery} />
               </div>
